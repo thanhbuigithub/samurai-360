@@ -135,7 +135,7 @@ def vos_inference(
     ]
     frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
     inference_state = predictor.init_state(
-        video_path=video_dir, async_loading_frames=False
+        video_path=video_dir, async_loading_frames=False, is_360=True
     )
     height = inference_state["video_height"]
     width = inference_state["video_width"]
@@ -222,7 +222,10 @@ def vos_inference(
     output_palette = input_palette or DAVIS_PALETTE
     video_segments = {}  # video_segments contains the per-frame segmentation results
     for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
-        inference_state
+        inference_state,
+        is_360=True,
+        early_stop_frames=10000,
+        threshold_percent=0
     ):
         per_obj_output_mask = {
             out_obj_id: (out_mask_logits[i] > score_thresh).cpu().numpy()
@@ -273,7 +276,7 @@ def vos_separate_inference_per_object(
     ]
     frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
     inference_state = predictor.init_state(
-        video_path=video_dir, async_loading_frames=False
+        video_path=video_dir, async_loading_frames=False, is_360=True
     )
     height = inference_state["video_height"]
     width = inference_state["video_width"]
@@ -322,6 +325,9 @@ def vos_separate_inference_per_object(
             inference_state,
             start_frame_idx=min(input_frame_inds),
             reverse=False,
+            is_360=True,
+            early_stop_frames=10000,
+            threshold_percent=0,
         ):
             obj_scores = out_mask_logits.cpu().numpy()
             output_scores_per_object[object_id][out_frame_idx] = obj_scores
