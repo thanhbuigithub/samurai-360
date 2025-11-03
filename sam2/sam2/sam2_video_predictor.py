@@ -273,6 +273,10 @@ class Omni360Helper:
             img_tensor = torch.from_numpy(img_tensor)
         img_tensor = img_tensor.to(device)
         
+        # Convert to float if needed (grid_sample requires float type)
+        if img_tensor.dtype != torch.float32 and img_tensor.dtype != torch.float64:
+            img_tensor = img_tensor.float()
+        
         # Convert R to torch if needed
         if not isinstance(R, torch.Tensor):
             R = torch.from_numpy(R).float()
@@ -347,6 +351,10 @@ class Omni360Helper:
         if not isinstance(img_tensor, torch.Tensor):
             img_tensor = torch.from_numpy(img_tensor)
         img_tensor = img_tensor.to(device)
+        
+        # Convert to float if needed (grid_sample requires float type)
+        if img_tensor.dtype != torch.float32 and img_tensor.dtype != torch.float64:
+            img_tensor = img_tensor.float()
         
         # Convert R to torch if needed
         if not isinstance(R_original, torch.Tensor):
