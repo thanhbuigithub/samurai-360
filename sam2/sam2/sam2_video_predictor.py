@@ -488,7 +488,7 @@ class Omni360Helper:
     
     # ========== GPU-Accelerated Methods ==========
     
-    def align_center_by_R_torch(self, img_tensor, R, device='cuda'):
+    def align_center_by_R_torch(self, img_tensor, R, device='cuda', interpolation_mode='auto'):
         """
         GPU-accelerated version of align_center_by_R using PyTorch operations.
         
@@ -499,6 +499,11 @@ class Omni360Helper:
             img_tensor: torch.Tensor (H, W, C) or (H, W) for single channel
             R: rotation matrix (3, 3) - numpy or torch.Tensor
             device: target device (default: 'cuda')
+            interpolation_mode: 'auto', 'nearest', 'bilinear', or 'bicubic'
+                - 'auto': automatically detect (nearest for binary mask, bicubic for images)
+                - 'nearest': best for binary masks (no artifacts, sharp edges)
+                - 'bilinear': faster but may cause artifacts on masks
+                - 'bicubic': best quality for images (smoother, slower)
             
         Returns:
             tuple: (out_img: torch.Tensor (same shape as input), R: torch.Tensor)
@@ -525,6 +530,13 @@ class Omni360Helper:
         if is_single_channel:
             img_tensor = img_tensor.unsqueeze(-1)  # (H, W) -> (H, W, 1)
         
+        # Auto-detect interpolation mode for masks vs images
+        if interpolation_mode == 'auto':
+            # Check if this is a binary mask (values are mostly 0 or 1)
+            unique_vals = torch.unique(img_tensor)
+            is_binary_mask = len(unique_vals) <= 3 and torch.all((unique_vals == 0) | (unique_vals == 1))
+            interpolation_mode = 'nearest' if is_binary_mask else 'bicubic'
+        
         # Check if dimensions match, update xyz if needed
         self._refresh_intrinsics(img_tensor.shape[1], img_tensor.shape[0])
         
@@ -550,9 +562,15 @@ class Omni360Helper:
         # Prepare image for grid_sample: (H, W, C) -> (1, C, H, W)
         img_for_sample = img_tensor.permute(2, 0, 1).unsqueeze(0)
         
-        # Apply grid sampling with border mode
-        out_img = torch.nn.functional.grid_sample(img_for_sample, grid, mode='bilinear', 
-                                padding_mode='border', align_corners=False)
+        # Apply grid sampling with appropriate interpolation mode
+        # For binary masks: use 'nearest' to prevent interpolation artifacts
+        # For images: use 'bicubic' for smoother, higher-quality results
+        out_img = torch.nn.functional.grid_sample(
+            img_for_sample, grid, 
+            mode=interpolation_mode, 
+            padding_mode='border', 
+            align_corners=False
+        )
         
         # Convert back: (1, C, H, W) -> (H, W, C)
         out_img = out_img.squeeze(0).permute(1, 2, 0)
@@ -563,7 +581,7 @@ class Omni360Helper:
         
         return out_img, R
     
-    def revert_alignment_by_matrix_torch(self, img_tensor, R_original, device='cuda'):
+    def revert_alignment_by_matrix_torch(self, img_tensor, R_original, device='cuda', interpolation_mode='auto'):
         """
         GPU-accelerated version of revert_alignment_by_matrix using PyTorch operations.
         
@@ -574,6 +592,11 @@ class Omni360Helper:
             img_tensor: torch.Tensor (H, W, C) or (H, W) for single channel
             R_original: rotation matrix (3, 3) - numpy or torch.Tensor
             device: target device (default: 'cuda')
+            interpolation_mode: 'auto', 'nearest', 'bilinear', or 'bicubic'
+                - 'auto': automatically detect (nearest for binary mask, bicubic for images)
+                - 'nearest': best for binary masks (no artifacts, sharp edges)
+                - 'bilinear': faster but may cause artifacts on masks
+                - 'bicubic': best quality for images (smoother, slower)
             
         Returns:
             reverted_img: torch.Tensor (same shape as input)
@@ -600,6 +623,13 @@ class Omni360Helper:
         if is_single_channel:
             img_tensor = img_tensor.unsqueeze(-1)  # (H, W) -> (H, W, 1)
         
+        # Auto-detect interpolation mode for masks vs images
+        if interpolation_mode == 'auto':
+            # Check if this is a binary mask (values are mostly 0 or 1)
+            unique_vals = torch.unique(img_tensor)
+            is_binary_mask = len(unique_vals) <= 3 and torch.all((unique_vals == 0) | (unique_vals == 1))
+            interpolation_mode = 'nearest' if is_binary_mask else 'bicubic'
+        
         # Check if dimensions match, update xyz if needed
         self._refresh_intrinsics(img_tensor.shape[1], img_tensor.shape[0])
         
@@ -625,9 +655,15 @@ class Omni360Helper:
         # Prepare image for grid_sample: (H, W, C) -> (1, C, H, W)
         img_for_sample = img_tensor.permute(2, 0, 1).unsqueeze(0)
         
-        # Apply grid sampling with border mode
-        reverted_img = torch.nn.functional.grid_sample(img_for_sample, grid, mode='bilinear',
-                                     padding_mode='border', align_corners=False)
+        # Apply grid sampling with appropriate interpolation mode
+        # For binary masks: use 'nearest' to prevent interpolation artifacts
+        # For images: use 'bicubic' for smoother, higher-quality results
+        reverted_img = torch.nn.functional.grid_sample(
+            img_for_sample, grid, 
+            mode=interpolation_mode,
+            padding_mode='border', 
+            align_corners=False
+        )
         
         # Convert back: (1, C, H, W) -> (H, W, C)
         reverted_img = reverted_img.squeeze(0).permute(1, 2, 0)
