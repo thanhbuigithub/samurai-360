@@ -223,9 +223,7 @@ def vos_inference(
     video_segments = {}  # video_segments contains the per-frame segmentation results
     for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
         inference_state,
-        is_360=True,
-        early_stop_frames=10000,
-        threshold_percent=0
+        is_360=True
     ):
         per_obj_output_mask = {
             out_obj_id: (out_mask_logits[i] > score_thresh).cpu().numpy()
@@ -325,9 +323,7 @@ def vos_separate_inference_per_object(
             inference_state,
             start_frame_idx=min(input_frame_inds),
             reverse=False,
-            is_360=True,
-            early_stop_frames=10000,
-            threshold_percent=0,
+            is_360=True
         ):
             obj_scores = out_mask_logits.cpu().numpy()
             output_scores_per_object[object_id][out_frame_idx] = obj_scores

@@ -81,6 +81,24 @@ class Omni360Helper:
         # Cache for GPU-accelerated operations (initialized lazily)
         self.xyz_torch = None
     
+    def _refresh_intrinsics(self, img_w, img_h):
+        """
+        Update cached intrinsics and spherical coordinate grid when resolution changes.
+        """
+        img_w = int(img_w)
+        img_h = int(img_h)
+        if img_w == self.img_w and img_h == self.img_h:
+            return
+        # print(f"Updating image dimensions to {img_w}x{img_h}", flush=True)
+        self.img_w = img_w
+        self.img_h = img_h
+        self.fx = self.img_w / (2 * np.pi)
+        self.fy = -self.img_h / np.pi
+        self.cx = self.img_w / 2
+        self.cy = self.img_h / 2
+        self.xyz = self._init_omni_image_cor()
+        self.xyz_torch = None  # Invalidate GPU cache
+    
     def _init_omni_image_cor(self, fov_h=360, fov_v=180):
         """
         Initialize omnidirectional image coordinate grid.
@@ -144,10 +162,45 @@ class Omni360Helper:
         """Convert pixel coordinates to 3D Cartesian coordinates."""
         lon, lat = self.uv2lonlat(u, v)
         return self.lonlat2xyz(lon, lat)
+
+    def is_mask_valid(self, mask_image):
+        """Check if mask is valid."""
+        if len(mask_image.shape) > 2:
+            mask = mask_image[:, :, 0].copy()
+        else:
+            mask = mask_image.copy()
+        v_coords, u_coords = np.where(mask > 127)
+        return len(v_coords) >= 8
+
+    def is_mask_valid_torch(self, mask_image):
+        """Check if mask is valid."""
+        if mask_image.dim() > 2:
+            mask = mask_image[..., 0]
+        else:
+            mask = mask_image
+
+        mask = mask.detach()
+        
+        if mask.dtype == torch.bool:
+            mask_bool = mask
+        else:
+            if mask.is_floating_point():
+                max_val = mask.max()
+                max_val_value = float(max_val.detach().item())
+                threshold = 0.5 if np.isfinite(max_val_value) and max_val_value <= 1.0 else 127.0
+            else:
+                threshold = 127
+            mask_bool = mask > threshold
+        
+        coords = torch.nonzero(mask_bool, as_tuple=False)
+        return coords.shape[0] >= 8
     
     def mask2Bfov(self, mask_image):
         """
         Convert mask to bounded field of view (Bfov) with spherical center.
+        
+        Handles crossing border cases where ROI wraps around the image edges.
+        Based on equations from the paper for proper 360 ROI center calculation.
         
         Args:
             mask_image: Binary mask (H, W) with values 0-255
@@ -165,15 +218,198 @@ class Omni360Helper:
         if len(v_coords) < 8:
             return None
         
-        # Get centroid
-        cx = np.mean(u_coords)
-        cy = np.mean(v_coords)
+        # Get bounding box coordinates
+        u_min, u_max = np.min(u_coords), np.max(u_coords)
+        v_min, v_max = np.min(v_coords), np.max(v_coords)
+        
+        # Check for crossing border case (ROI wraps around horizontally)
+        # If width spans = width of image, likely crossing border
+        roi_width = u_max - u_min
+        crossing_border_h = roi_width >= self.img_w
+        
+        # Similar check for vertical (less common but possible)
+        roi_height = v_max - v_min
+        crossing_border_v = roi_height >= self.img_h
+        
+        # Calculate center coordinates
+        if crossing_border_h:
+            # Crossing border horizontally
+            # Split coordinates into left and right halves
+            c_x = self.img_w / 2.0
+            left_coords = u_coords[u_coords < c_x]
+            right_coords = u_coords[u_coords > c_x]
+            
+            if len(left_coords) > 0 and len(right_coords) > 0:
+                u_l = np.max(left_coords)   # rightmost point on left side
+                u_r = np.min(right_coords)  # leftmost point on right side
+                # Center calculation for crossing border
+                u_c = u_r + (self.img_w - (u_r - u_l)) / 2.0
+                # Wrap around if needed
+                if u_c >= self.img_w:
+                    u_c -= self.img_w
+            else:
+                # Fallback to simple mean
+                u_c = np.mean(u_coords)
+        else:
+            # Normal case: simple midpoint
+            u_c = (u_max + u_min) / 2.0
+        
+        if crossing_border_v:
+            # Crossing border vertically (rare for equirectangular)
+            c_y = self.img_h / 2.0
+            bottom_coords = v_coords[v_coords < c_y]
+            top_coords = v_coords[v_coords > c_y]
+            
+            if len(bottom_coords) > 0 and len(top_coords) > 0:
+                v_b = np.max(bottom_coords)  # bottom-most point in upper half
+                v_t = np.min(top_coords)     # top-most point in lower half
+                # Center calculation for crossing border
+                v_c = v_t + (self.img_h - (v_t - v_b)) / 2.0
+                # Wrap around if needed
+                if v_c >= self.img_h:
+                    v_c -= self.img_h
+            else:
+                # Fallback to simple mean
+                v_c = np.mean(v_coords)
+        else:
+            # Normal case: simple midpoint
+            v_c = (v_max + v_min) / 2.0
         
         # Convert to lon/lat
-        clon, clat = self.uv2lonlat(cx, cy)
+        clon, clat = self.uv2lonlat(u_c, v_c)
         
         return {'clon': rad2ang(clon), 'clat': rad2ang(clat)}
     
+    def mask2Bfov_torch(self, mask_image):
+        """
+        Torch implementation of mask2Bfov for GPU-accelerated workflows.
+        
+        Args:
+            mask_image: torch.Tensor binary mask (H, W) or (H, W, 1)
+        
+        Returns:
+            dict with keys clon, clat in degrees, or None if mask invalid
+        """
+        if not isinstance(mask_image, torch.Tensor):
+            raise TypeError("mask2Bfov_torch expects mask_image to be a torch.Tensor")
+        
+        if mask_image.dim() > 2:
+            mask = mask_image[..., 0]
+        else:
+            mask = mask_image
+        
+        mask = mask.squeeze()
+        if mask.dim() != 2:
+            raise ValueError("mask2Bfov_torch expects a 2D mask after squeezing channels")
+        
+        self._refresh_intrinsics(mask.shape[1], mask.shape[0])
+        mask = mask.detach()
+        
+        if mask.dtype == torch.bool:
+            mask_bool = mask
+        else:
+            if mask.is_floating_point():
+                max_val = mask.max()
+                max_val_value = float(max_val.detach().item())
+                threshold = 0.5 if np.isfinite(max_val_value) and max_val_value <= 1.0 else 127.0
+            else:
+                threshold = 127
+            mask_bool = mask > threshold
+        
+        coords = torch.nonzero(mask_bool, as_tuple=False)
+        if coords.shape[0] < 8:
+            return None
+        
+        v_coords = coords[:, 0].float()
+        u_coords = coords[:, 1].float()
+        
+        u_min, u_max = torch.min(u_coords), torch.max(u_coords)
+        v_min, v_max = torch.min(v_coords), torch.max(v_coords)
+        
+        roi_width = u_max - u_min
+        crossing_border_h = bool((roi_width >= float(self.img_w)).item())
+        
+        roi_height = v_max - v_min
+        crossing_border_v = bool((roi_height >= float(self.img_h)).item())
+        
+        if crossing_border_h:
+            c_x = self.img_w / 2.0
+            left_coords = u_coords[u_coords < c_x]
+            right_coords = u_coords[u_coords > c_x]
+            
+            if left_coords.numel() > 0 and right_coords.numel() > 0:
+                u_l = torch.max(left_coords)
+                u_r = torch.min(right_coords)
+                u_c = u_r + (self.img_w - (u_r - u_l)) / 2.0
+                u_c = torch.remainder(u_c, self.img_w)
+            else:
+                u_c = torch.mean(u_coords)
+        else:
+            u_c = (u_max + u_min) / 2.0
+        
+        if crossing_border_v:
+            c_y = self.img_h / 2.0
+            bottom_coords = v_coords[v_coords < c_y]
+            top_coords = v_coords[v_coords > c_y]
+            
+            if bottom_coords.numel() > 0 and top_coords.numel() > 0:
+                v_b = torch.max(bottom_coords)
+                v_t = torch.min(top_coords)
+                v_c = v_t + (self.img_h - (v_t - v_b)) / 2.0
+                v_c = torch.remainder(v_c, self.img_h)
+            else:
+                v_c = torch.mean(v_coords)
+        else:
+            v_c = (v_max + v_min) / 2.0
+        
+        u_c_val = float(u_c.item() if isinstance(u_c, torch.Tensor) else u_c)
+        v_c_val = float(v_c.item() if isinstance(v_c, torch.Tensor) else v_c)
+        
+        clon, clat = self.uv2lonlat(u_c_val, v_c_val)
+        
+        clon_deg = rad2ang(clon)
+        clat_deg = rad2ang(clat)
+        if isinstance(clon_deg, torch.Tensor):
+            clon_deg = float(clon_deg.item())
+        if isinstance(clat_deg, torch.Tensor):
+            clat_deg = float(clat_deg.item())
+        
+        return {'clon': clon_deg, 'clat': clat_deg}
+    
+    def mask2R(self, mask_image):
+        """
+        Convert mask to rotation matrix R.
+        
+        Args:
+            mask_image: Binary mask (H, W) with values 0-255
+            
+        Returns:
+            R: 3x3 rotation matrix
+        """
+        bfov = self.mask2Bfov(mask_image)
+        if bfov is None:
+            return None
+        c_lon = ang2rad(bfov['clon'])
+        c_lat = ang2rad(bfov['clat'])
+        return rotate_y(c_lon) @ rotate_x(c_lat)
+
+    def mask2R_torch(self, mask_image):
+        """
+        Convert mask to rotation matrix R.
+        
+        Args:
+            mask_image: torch.Tensor binary mask (H, W) or (H, W, 1)
+            
+        Returns:
+            R: 3x3 rotation matrix
+        """
+        bfov = self.mask2Bfov_torch(mask_image)
+        if bfov is None:
+            return None
+        c_lon = ang2rad(bfov['clon'])
+        c_lat = ang2rad(bfov['clat'])
+        return rotate_y(c_lon) @ rotate_x(c_lat)
+
     def align_center_by_R(self, img, R):
         """
         Align image center using rotation matrix R.
@@ -290,11 +526,7 @@ class Omni360Helper:
             img_tensor = img_tensor.unsqueeze(-1)  # (H, W) -> (H, W, 1)
         
         # Check if dimensions match, update xyz if needed
-        if img_tensor.shape[0] != self.img_h or img_tensor.shape[1] != self.img_w:
-            self.img_w = img_tensor.shape[1]
-            self.img_h = img_tensor.shape[0]
-            self.xyz = self._init_omni_image_cor()
-            self.xyz_torch = None  # Invalidate cache
+        self._refresh_intrinsics(img_tensor.shape[1], img_tensor.shape[0])
         
         # Convert xyz to torch and cache it
         if self.xyz_torch is None or self.xyz_torch.device != device:
@@ -369,11 +601,7 @@ class Omni360Helper:
             img_tensor = img_tensor.unsqueeze(-1)  # (H, W) -> (H, W, 1)
         
         # Check if dimensions match, update xyz if needed
-        if img_tensor.shape[0] != self.img_h or img_tensor.shape[1] != self.img_w:
-            self.img_w = img_tensor.shape[1]
-            self.img_h = img_tensor.shape[0]
-            self.xyz = self._init_omni_image_cor()
-            self.xyz_torch = None  # Invalidate cache
+        self._refresh_intrinsics(img_tensor.shape[1], img_tensor.shape[0])
         
         # Convert xyz to torch and cache it
         if self.xyz_torch is None or self.xyz_torch.device != device:
@@ -453,6 +681,7 @@ class SAM2VideoPredictor(SAM2Base):
             offload_state_to_cpu: Whether to store inference state on CPU
             async_loading_frames: Whether to load frames asynchronously
             is_360: Whether to enable 360 video tracking (requires VOT360 library)
+            initial_mask: Initial mask (H, W) with values 0-255
         """
         compute_device = self.device  # device of the model
         images, video_height, video_width = load_video_frames(
@@ -465,19 +694,6 @@ class SAM2VideoPredictor(SAM2Base):
         inference_state = {}
         inference_state["images"] = images
         inference_state["num_frames"] = len(images)
-        
-        # Store 360 video tracking configuration
-        inference_state["is_360"] = is_360
-        
-        # Initialize 360 helper if enabled
-        if is_360:
-            # Initialize Omni360Helper for spherical transformations
-            inference_state["omni_helper"] = Omni360Helper(img_w=video_width, img_h=video_height)
-            # Store rotation matrices for each frame (populated during tracking)
-            inference_state["rotation_matrices"] = {}
-        else:
-            inference_state["omni_helper"] = None
-            inference_state["rotation_matrices"] = {}
         # whether to offload the video frames to CPU memory
         # turning on this option saves the GPU memory with only a very small overhead
         inference_state["offload_video_to_cpu"] = offload_video_to_cpu
@@ -524,6 +740,15 @@ class SAM2VideoPredictor(SAM2Base):
         # metadata for each tracking frame (e.g. which direction it's tracked)
         inference_state["tracking_has_started"] = False
         inference_state["frames_already_tracked"] = {}
+        # Store 360 video tracking configuration
+        inference_state["is_360"] = is_360
+        if is_360:
+            # Initialize Omni360Helper for spherical transformations
+            inference_state["omni_helper"] = Omni360Helper(img_w=video_width, img_h=video_height)
+            # Store rotation matrices for each batch (populated during tracking)
+            inference_state["rotation_matrices"] = {}
+        else:
+            inference_state["omni_helper"] = None
         # Warm up the visual backbone and cache the image feature on frame 0
         self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
         return inference_state
@@ -751,6 +976,39 @@ class SAM2VideoPredictor(SAM2Base):
         if not isinstance(mask, torch.Tensor):
             mask = torch.tensor(mask, dtype=torch.bool)
         assert mask.dim() == 2
+
+        # Align mask and image to the center of the sphere
+        is_360 = inference_state["is_360"]
+        omni_helper = inference_state["omni_helper"]
+        device = inference_state["device"]
+        R_mask = None
+        # print(f"Adding new mask at frame {frame_idx}. Enabled 360: {is_360}", flush=True)
+        if is_360:
+            R_mask = omni_helper.mask2R_torch(mask)
+            # print(f"R_mask: {R_mask}", flush=True)
+        if R_mask is not None:
+            mask, _ = omni_helper.align_center_by_R_torch(mask, R_mask, device)
+            # original_frame = inference_state["images"][frame_idx].clone()
+            norm_tensor = inference_state["images"][frame_idx]
+            # Denormalize on GPU
+            # img_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
+            # img_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
+            # img_tensor = norm_tensor * img_std + img_mean  # (3, H, W) in [0, 1]
+            # img_tensor = (img_tensor * 255).clamp(0, 255).to(torch.uint8)  # (3, H, W) in [0, 255]
+            # img_tensor = img_tensor.permute(1, 2, 0)  # (H, W, 3)
+            img_tensor = norm_tensor.permute(1, 2, 0)
+            
+            # Rotate on GPU
+            centered_frame, _ = omni_helper.align_center_by_R_torch(img_tensor, R_mask, device)
+            
+            # Re-normalize on GPU
+            # centered_frame = centered_frame.permute(2, 0, 1).float() / 255.0  # (3, H, W)
+            # normalized = (centered_frame - img_mean) / img_std
+            normalized = centered_frame.permute(2, 0, 1)
+            inference_state["images"][frame_idx] = normalized
+            inference_state["cached_features"].pop(frame_idx, None)
+            # print(f"Aligning mask at frame {frame_idx} to center of sphere", flush=True)
+
         mask_H, mask_W = mask.shape
         mask_inputs_orig = mask[None, None]  # add batch and channel dimension
         mask_inputs_orig = mask_inputs_orig.float().to(inference_state["device"])
@@ -817,6 +1075,14 @@ class SAM2VideoPredictor(SAM2Base):
         _, video_res_masks = self._get_orig_video_res_output(
             inference_state, consolidated_out["pred_masks_video_res"]
         )
+
+        # Revert the image to the original orientation
+        if is_360 and R_mask is not None:
+            inference_state["rotation_matrices"][0] = R_mask
+            # print(f"Updated inference_state[\"rotation_matrices\"][0] = {R_mask}", flush=True)
+            # if original_frame is not None:
+            #     inference_state["images"][frame_idx] = original_frame
+
         return frame_idx, obj_ids, video_res_masks
 
     def _get_orig_video_res_output(self, inference_state, any_res_masks):
@@ -1085,25 +1351,26 @@ class SAM2VideoPredictor(SAM2Base):
         max_frame_num_to_track=None,
         reverse=False,
         is_360=False,
-        early_stop_frames=5,
-        threshold_percent=0.7,
+        batch_frames=30,
     ):
         """Propagate the input points across frames to track in the entire video.
         
-        For 360 video tracking (when is_360=True), this function will:
-        1. Extract ROI from previous frame's mask
-        2. Center both previous and current frames on the ROI (GPU-optimized)
-        3. Run inference on centered frames
+        For 360 video tracking (when is_360=True), this function uses batch processing:
+        1. Video is divided into batches (default: 30 frames ~1 second at 30 FPS)
+        2. At each batch boundary:
+           - Calculate rotation matrix R_b from last frame's mask of previous batch
+           - Reset memory (cached_features, non_cond_frame_outputs)
+           - Rotate all frames in batch at once (GPU-optimized)
+        3. Run inference on centered frames within each batch
         4. Revert masks back to original 360 position (GPU-optimized)
         5. Check mask validity for early stopping (GPU-optimized)
-        6. Continue to next frame
         
         GPU Performance Optimizations:
+            - Batch frame rotation: Pre-rotate all frames at once on GPU
+            - Batch mask reversion: Revert all masks at once on GPU
             - Early stopping: Pure GPU operations, only transfers scalar pixel count
-            - 360 frame centering: Keeps tensors on GPU when torch methods available
-            - 360 mask reversion: Eliminates CPU-GPU transfers for mask processing
             - Expected speedup: 30-70% faster for 360 videos on CUDA devices
-            - Automatic fallback: Uses CPU methods on non-CUDA devices or if torch methods unavailable
+            - Automatic fallback: Uses CPU methods on non-CUDA devices
         
         Args:
             inference_state: The inference state dictionary
@@ -1111,8 +1378,7 @@ class SAM2VideoPredictor(SAM2Base):
             max_frame_num_to_track: Maximum number of frames to track (default: all frames)
             reverse: Whether to track in reverse order
             is_360: Whether to use 360 video tracking (requires is_360=True in init_state)
-            early_stop_frames: Number of consecutive invalid frames before stopping (default: 5)
-            threshold_percent: Minimum percentage of initial mask pixels to consider valid (default: 0.7)
+            batch_frames: Number of frames per batch for 360 video tracking (default: 30)
         """
         self.propagate_in_video_preflight(inference_state)
 
@@ -1120,6 +1386,7 @@ class SAM2VideoPredictor(SAM2Base):
         consolidated_frame_inds = inference_state["consolidated_frame_inds"]
         obj_ids = inference_state["obj_ids"]
         num_frames = inference_state["num_frames"]
+        rotation_matrices = inference_state.get("rotation_matrices", {})
         batch_size = self._get_obj_num(inference_state)
         if len(output_dict["cond_frame_outputs"]) == 0:
             raise RuntimeError("No points are provided; please add points first")
@@ -1148,81 +1415,159 @@ class SAM2VideoPredictor(SAM2Base):
 
         # Initialize 360 tracking state
         is_360_enabled = is_360 and inference_state.get("is_360", False)
-        prev_frame_idx = None
         
         # Initialize early stopping state
         consecutive_invalid_frames = 0
         initial_mask_pixel_count = None
+        
+        # Initialize batch processing state for 360 video tracking
+        current_batch = 0
+        R_b = rotation_matrices.get(current_batch, None)  # Rotation matrix for current batch
+        # original_frames = {}  # Store original frames before rotation
+        batch_masks_to_revert = {}  # Store masks that need reversion after batch processing
+        last_valid_mask_in_batch = None
+
+        # print(f"360 Enabled: {is_360_enabled}", flush=True)
 
         for frame_idx in tqdm(processing_order, desc="propagate in video"):
-            # ========== 360 Video Tracking: Center frames before inference (GPU Optimized) ==========
-            if is_360_enabled and prev_frame_idx is not None:
-                # Get previous frame's mask to determine ROI center
-                prev_mask = self._get_mask_from_frame_output(inference_state, prev_frame_idx, obj_idx=0)
+            # ========== Batch Processing for 360 Video Tracking ==========
+            # Check if entering a new batch
+            frame_idx_in_batch = (frame_idx - start_frame_idx) % batch_frames
+            if is_360_enabled and frame_idx_in_batch == 0:
+                # print(f"Entering new batch at frame {frame_idx}", flush=True)
+                current_batch += 1
+                # Calculate R_b from last frame's mask of previous batch
+                if frame_idx > start_frame_idx:
+                    # print(f"Reverting previous batch masks before starting new batch", flush=True)
+                    # Revert previous batch masks before starting new batch
+                    if len(batch_masks_to_revert) > 0 and R_b is not None:
+                        device = inference_state["device"]
+                        omni_helper = inference_state["omni_helper"]
+                        
+                        # GPU-accelerated batch mask reversion
+                        if hasattr(omni_helper, 'revert_alignment_by_matrix_torch') and device.type == 'cuda':
+                            for batch_frame_idx, (masks, storage_key) in batch_masks_to_revert.items():
+                                reverted_masks = []
+                                for obj_idx_iter in range(len(obj_ids)):
+                                    mask = masks[obj_idx_iter, 0]  # Keep on GPU (H, W)
+                                    
+                                    # # Convert to uint8 range on GPU
+                                    # mask_uint8 = (mask > 0.0).to(torch.uint8) * 255
+                                    
+                                    # Revert on GPU
+                                    reverted_mask = omni_helper.revert_alignment_by_matrix_torch(
+                                        mask, R_b, device
+                                    )
+                                    
+                                    # Convert back to float on GPU
+                                    # reverted_mask = (reverted_mask_uint8.float() / 255.0) * 2.0 - 1.0
+                                    reverted_masks.append(reverted_mask)
+                                
+                                # Stack masks (stay on GPU)
+                                reverted_masks_tensor = torch.stack(reverted_masks).unsqueeze(1)
+                                
+                                # Update stored masks in output_dict
+                                # storage_device = inference_state["storage_device"]
+                                # output_dict[storage_key][batch_frame_idx]["pred_masks"] = reverted_masks_tensor.to(storage_device, non_blocking=True)
+                                yield batch_frame_idx, obj_ids, reverted_masks_tensor, R_b
+                        else:
+                            # CPU fallback
+                            for batch_frame_idx, (masks, storage_key) in batch_masks_to_revert.items():
+                                masks_np = masks.cpu().numpy()
+                                reverted_masks = []
+                                for obj_idx_iter in range(len(obj_ids)):
+                                    mask = masks_np[obj_idx_iter, 0]  # (H, W)
+                                    
+                                    # Convert mask to uint8
+                                    mask_uint8 = ((mask > 0.0).astype(np.uint8) * 255)
+                                    
+                                    # Revert the 360 transformation
+                                    reverted_mask_uint8 = omni_helper.revert_alignment_by_matrix(mask_uint8, R_b)
+                                    
+                                    # Convert back to float
+                                    reverted_mask = (reverted_mask_uint8.astype(np.float32) / 255.0) * 2.0 - 1.0
+                                    reverted_masks.append(reverted_mask)
+                                
+                                # Convert back to tensor
+                                reverted_masks_tensor = torch.from_numpy(
+                                    np.array(reverted_masks)[:, None, :, :]
+                                ).to(device)
+                                
+                                # Update stored masks in output_dict
+                                # storage_device = inference_state["storage_device"]
+                                # output_dict[storage_key][batch_frame_idx]["pred_masks"] = reverted_masks_tensor.to(storage_device, non_blocking=True)
+                                yield batch_frame_idx, obj_ids, reverted_masks_tensor, R_b
+
+                        # Clear batch masks dict for new batch
+                        batch_masks_to_revert.clear()
+
+                    # Calculate new R_b from last valid mask in batch
+                    if last_valid_mask_in_batch is not None:
+                        # print(f"Calculating new R_b from last valid mask in batch", flush=True)
+                        omni_helper = inference_state["omni_helper"]
+                        R_b = omni_helper.mask2R_torch(last_valid_mask_in_batch)
+                        rotation_matrices[current_batch] = R_b
+                    # # Restore original frames before rotating new batch
+                    # for orig_idx, orig_frame in original_frames.items():
+                    #     inference_state["images"][orig_idx] = orig_frame
+                    # original_frames.clear()
                 
-                if prev_mask is not None:
+                # Rotate all frames in this batch at once (GPU optimized)
+                if R_b is not None:
+                    # print(f"R_b: {R_b}", flush=True)
+                    # print(f"Rotating frames in batch at frame {frame_idx}", flush=True)
+                    batch_end = min(frame_idx + batch_frames, end_frame_idx + 1)
+                    device = inference_state["device"]
                     omni_helper = inference_state["omni_helper"]
                     
-                    # Convert mask to Bfov to find spherical center (work at model resolution)
-                    bfov = omni_helper.mask2Bfov(prev_mask)
+                    if hasattr(omni_helper, 'align_center_by_R_torch') and device.type == 'cuda':
+                        # GPU path: batch rotate all frames
+                        for idx in range(frame_idx, batch_end):
+                            if idx < len(inference_state["images"]):
+                                # Save original frame
+                                # original_frames[idx] = inference_state["images"][idx].clone()
+                                
+                                norm_tensor = inference_state["images"][idx]
+                                # Denormalize on GPU
+                                # img_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
+                                # img_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
+                                # img_tensor = norm_tensor * img_std + img_mean  # (3, H, W) in [0, 1]
+                                # img_tensor = (img_tensor * 255).clamp(0, 255).to(torch.uint8)  # (3, H, W) in [0, 255]
+                                # img_tensor = img_tensor.permute(1, 2, 0)  # (H, W, 3)
+                                img_tensor = norm_tensor.permute(1, 2, 0)
+                                
+                                # Rotate on GPU
+                                centered_frame, _ = omni_helper.align_center_by_R_torch(img_tensor, R_b, device)
+                                
+                                # Re-normalize on GPU
+                                # centered_frame = centered_frame.permute(2, 0, 1).float() / 255.0  # (3, H, W)
+                                # normalized = (centered_frame - img_mean) / img_std
+                                normalized = centered_frame.permute(2, 0, 1)
+                                
+                                # Update in inference_state
+                                # print(f"Updating inference_state with normalized frame at frame {idx}", flush=True)
+                                inference_state["images"][idx] = normalized
+                    else:
+                        # CPU fallback
+                        for idx in range(frame_idx, batch_end):
+                            if idx < len(inference_state["images"]):
+                                # Save original frame
+                                # original_frames[idx] = inference_state["images"][idx].clone()
+                                
+                                norm_tensor = inference_state["images"][idx]
+                                img_np = self._denormalize_tensor_to_numpy(norm_tensor)
+                                
+                                # Rotate on CPU
+                                centered_frame, _ = omni_helper.align_center_by_R(img_np, R_b)
+                                
+                                # Re-normalize
+                                normalized = self._normalize_numpy_to_tensor(centered_frame, device)
+                                inference_state["images"][idx] = normalized
                     
-                    if bfov is not None:
-                        # Calculate rotation matrix for centering
-                        c_lon = ang2rad(bfov['clon'])
-                        c_lat = ang2rad(bfov['clat'])
-                        R = rotate_y(c_lon) @ rotate_x(c_lat)
-                        
-                        # Store R matrix for later reversion
-                        inference_state["rotation_matrices"][frame_idx] = R
-                        
-                        # Transform previous and current frame
-                        device = inference_state["device"]
-                        
-                        # Check if GPU method available and device is CUDA
-                        if hasattr(omni_helper, 'align_center_by_R_torch') and device.type == 'cuda':
-                            # GPU path - keep everything on GPU
-                            for idx in [prev_frame_idx, frame_idx]:
-                                if idx < len(inference_state["images"]):
-                                    # Get normalized tensor (3, H, W)
-                                    norm_tensor = inference_state["images"][idx]
-                                    
-                                    # Denormalize on GPU
-                                    img_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
-                                    img_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
-                                    img_tensor = norm_tensor * img_std + img_mean  # (3, H, W) in [0, 1]
-                                    img_tensor = (img_tensor * 255).clamp(0, 255).to(torch.uint8)  # (3, H, W) in [0, 255]
-                                    
-                                    # Convert to (H, W, 3) for omni_helper
-                                    img_tensor = img_tensor.permute(1, 2, 0)  # (H, W, 3)
-                                    
-                                    # Apply 360 centering transformation on GPU
-                                    centered_frame, _ = omni_helper.align_center_by_R_torch(img_tensor, R, device)
-                                    
-                                    # Re-normalize on GPU: (H, W, 3) -> (3, H, W)
-                                    centered_frame = centered_frame.permute(2, 0, 1).float()  # (3, H, W)
-                                    centered_frame = centered_frame / 255.0  # [0, 1]
-                                    normalized = (centered_frame - img_mean) / img_std
-                                    
-                                    # Update in inference_state
-                                    inference_state["images"][idx] = normalized
-                        else:
-                            # Fallback to CPU path
-                            for idx in [prev_frame_idx, frame_idx]:
-                                if idx < len(inference_state["images"]):
-                                    # Get normalized tensor and denormalize
-                                    norm_tensor = inference_state["images"][idx]
-                                    img_np = self._denormalize_tensor_to_numpy(norm_tensor)
-                                    
-                                    # Apply 360 centering transformation
-                                    centered_frame, _ = omni_helper.align_center_by_R(img_np, R)
-                                    
-                                    # Re-normalize and update in inference_state["images"]
-                                    normalized = self._normalize_numpy_to_tensor(centered_frame, device)
-                                    inference_state["images"][idx] = normalized
-                        
-                        # Clear cached features since frames changed
-                        inference_state["cached_features"].clear()
-            
+                    # Clear cached features since frames changed
+                    # inference_state["cached_features"].clear()
+                
+            # print(f"Frame {frame_idx_in_batch} of batch {current_batch}", flush=True)
             # ========== Standard SAM2 Tracking Logic ==========
             # We skip those frames already in consolidated outputs (these are frames
             # that received input clicks or mask). Note that we cannot directly run
@@ -1258,7 +1603,11 @@ class SAM2VideoPredictor(SAM2Base):
             self._add_output_per_object(
                 inference_state, frame_idx, current_out, storage_key
             )
-            inference_state["frames_already_tracked"][frame_idx] = {"reverse": reverse}
+            inference_state["frames_already_tracked"][frame_idx] = {
+                "reverse": reverse,
+                "batch": current_batch,
+                "frame_idx_in_batch": frame_idx_in_batch,
+            }
 
             # Resize the output mask to the original video resolution (we directly use
             # the mask scores on GPU for output to avoid any CPU conversion in between)
@@ -1266,95 +1615,78 @@ class SAM2VideoPredictor(SAM2Base):
                 inference_state, pred_masks
             )
             
-            # ========== 360 Video Tracking: Revert mask transformation (GPU Optimized) ==========
-            if is_360_enabled and frame_idx in inference_state["rotation_matrices"]:
-                # Revert mask transformation to original 360 position
-                R = inference_state["rotation_matrices"][frame_idx]
-                omni_helper = inference_state["omni_helper"]
-                device = inference_state["device"]
-                
-                # Check if GPU method available and device is CUDA
-                if hasattr(omni_helper, 'revert_alignment_by_matrix_torch') and device.type == 'cuda':
-                    # GPU path - no CPU transfer!
+            # ========== 360 Video Tracking: Store masks for batch reversion ==========
+            # Store masks for batch reversion at next batch boundary
+            if is_360_enabled and R_b is not None:
+                # Store masks for later reversion (keep on GPU)
+                batch_masks_to_revert[frame_idx] = (video_res_masks.clone(), storage_key)
+        
+        # ========== Final Batch Mask Reversion for 360 Video ==========
+        # Revert masks from the last batch after loop completes
+        if is_360_enabled and len(batch_masks_to_revert) > 0 and R_b is not None:
+            device = inference_state["device"]
+            omni_helper = inference_state["omni_helper"]
+            
+            # GPU-accelerated batch mask reversion for final batch
+            if hasattr(omni_helper, 'revert_alignment_by_matrix_torch') and device.type == 'cuda':
+                for batch_frame_idx, (masks, storage_key) in batch_masks_to_revert.items():
                     reverted_masks = []
-                    for obj_idx in range(len(obj_ids)):
-                        mask = video_res_masks[obj_idx, 0]  # Keep on GPU (H, W)
+                    for obj_idx_iter in range(len(obj_ids)):
+                        mask = masks[obj_idx_iter, 0]  # Keep on GPU (H, W)
                         
                         # Convert to uint8 range on GPU
-                        mask_uint8 = (mask > 0.0).to(torch.uint8) * 255
+                        # mask_uint8 = (mask > 0.0).to(torch.uint8) * 255
                         
                         # Revert on GPU
                         reverted_mask_uint8 = omni_helper.revert_alignment_by_matrix_torch(
-                            mask_uint8, R, device
+                            mask_uint8, R_b, device
                         )
                         
                         # Convert back to float on GPU
-                        reverted_mask = (reverted_mask_uint8.float() / 255.0) * 2.0 - 1.0
+                        # reverted_mask = (reverted_mask_uint8.float() / 255.0) * 2.0 - 1.0
                         reverted_masks.append(reverted_mask)
                     
                     # Stack masks (stay on GPU)
-                    video_res_masks = torch.stack(reverted_masks).unsqueeze(1)
-                    
-                else:
-                    # Fallback to CPU path for non-CUDA devices or if torch method not available
-                    video_res_masks_np = video_res_masks.cpu().numpy()
-                    
+                    reverted_masks_tensor = torch.stack(reverted_masks).unsqueeze(1)
+
+                    # Update stored masks in output_dict
+                    # storage_device = inference_state["storage_device"]
+                    # output_dict[storage_key][batch_frame_idx]["pred_masks"] = reverted_masks_tensor.to(storage_device, non_blocking=True)
+                    yield batch_frame_idx, obj_ids, reverted_masks_tensor, R_b
+            else:
+                # CPU fallback
+                for batch_frame_idx, (masks, storage_key) in batch_masks_to_revert.items():
+                    masks_np = masks.cpu().numpy()
                     reverted_masks = []
-                    for obj_idx in range(len(obj_ids)):
-                        mask = video_res_masks_np[obj_idx, 0]  # (H, W)
+                    for obj_idx_iter in range(len(obj_ids)):
+                        mask = masks_np[obj_idx_iter, 0]  # (H, W)
                         
-                        # Convert mask to uint8 for revert_alignment_by_matrix
+                        # Convert mask to uint8
                         mask_uint8 = ((mask > 0.0).astype(np.uint8) * 255)
                         
                         # Revert the 360 transformation
-                        reverted_mask_uint8 = omni_helper.revert_alignment_by_matrix(mask_uint8, R)
+                        reverted_mask_uint8 = omni_helper.revert_alignment_by_matrix(mask_uint8, R_b)
                         
-                        # Convert back to float for consistency
+                        # Convert back to float
                         reverted_mask = (reverted_mask_uint8.astype(np.float32) / 255.0) * 2.0 - 1.0
                         reverted_masks.append(reverted_mask)
                     
                     # Convert back to tensor
-                    video_res_masks = torch.from_numpy(
+                    reverted_masks_tensor = torch.from_numpy(
                         np.array(reverted_masks)[:, None, :, :]
                     ).to(device)
-                
-                # Update stored masks in current_out (which is already in output_dict)
-                storage_device = inference_state["storage_device"]
-                current_out["pred_masks"] = video_res_masks.to(storage_device, non_blocking=True)
-            
-            # ========== Early Stopping: Check mask validity (GPU Optimized) ==========
-            # Store initial mask pixel count from first frame (conditioning frame)
-            if threshold_percent > 0 and frame_idx == start_frame_idx and initial_mask_pixel_count is None:
-                # Get pixel count from first mask - GPU optimized, only transfer scalar
-                mask_binary = (video_res_masks > 0.0)[0, 0]
-                initial_mask_pixel_count = mask_binary.sum().item()
-            
-            # Check current mask validity (skip for initial frame)
-            if threshold_percent > 0 and frame_idx != start_frame_idx and initial_mask_pixel_count is not None:
-                # Count pixels > 0 in current mask (first object) - GPU optimized
-                mask_binary = (video_res_masks > 0.0)[0, 0]
-                current_pixel_count = mask_binary.sum().item()
-                threshold_count = initial_mask_pixel_count * threshold_percent
-                
-                if current_pixel_count >= threshold_count:
-                    # Valid mask - reset counter
-                    consecutive_invalid_frames = 0
-                else:
-                    # Invalid mask - increment counter
-                    consecutive_invalid_frames += 1
                     
-                # Check if we should stop early
-                if consecutive_invalid_frames >= early_stop_frames:
-                    print(f"Early stopping at frame {frame_idx}: {consecutive_invalid_frames} consecutive invalid frames")
-                    # Update prev_frame_idx before breaking
-                    prev_frame_idx = frame_idx
-                    yield frame_idx, obj_ids, video_res_masks
-                    break
-            
-            # Update prev_frame_idx for next iteration
-            prev_frame_idx = frame_idx
-            
-            yield frame_idx, obj_ids, video_res_masks
+                    # Update stored masks in output_dict
+                    # storage_device = inference_state["storage_device"]
+                    # output_dict[storage_key][batch_frame_idx]["pred_masks"] = reverted_masks_tensor.to(storage_device, non_blocking=True)
+                    yield batch_frame_idx, obj_ids, reverted_masks_tensor, R_b
+            batch_masks_to_revert.clear()
+        
+        # # Restore original frames after all processing
+        # if is_360_enabled and len(original_frames) > 0:
+        #     for orig_idx, orig_frame in original_frames.items():
+        #         inference_state["images"][orig_idx] = orig_frame
+        #     original_frames.clear()
 
     def _add_output_per_object(
         self, inference_state, frame_idx, current_out, storage_key
