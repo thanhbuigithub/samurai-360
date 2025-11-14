@@ -1633,13 +1633,13 @@ class SAM2VideoPredictor(SAM2Base):
                     reverted_masks = []
                     for obj_idx_iter in range(len(obj_ids)):
                         mask = masks[obj_idx_iter, 0]  # Keep on GPU (H, W)
-                        
-                        # Convert to uint8 range on GPU
+                                    
+                        # # Convert to uint8 range on GPU
                         # mask_uint8 = (mask > 0.0).to(torch.uint8) * 255
                         
                         # Revert on GPU
-                        reverted_mask_uint8 = omni_helper.revert_alignment_by_matrix_torch(
-                            mask_uint8, R_b, device
+                        reverted_mask = omni_helper.revert_alignment_by_matrix_torch(
+                            mask, R_b, device
                         )
                         
                         # Convert back to float on GPU
