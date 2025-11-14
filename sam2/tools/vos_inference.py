@@ -221,7 +221,7 @@ def vos_inference(
     os.makedirs(os.path.join(output_mask_dir, video_name), exist_ok=True)
     output_palette = input_palette or DAVIS_PALETTE
     video_segments = {}  # video_segments contains the per-frame segmentation results
-    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+    for out_frame_idx, out_obj_ids, out_mask_logits, _ in predictor.propagate_in_video(
         inference_state,
         is_360=True
     ):
@@ -319,7 +319,7 @@ def vos_separate_inference_per_object(
             )
 
         # run propagation throughout the video and collect the results in a dict
-        for out_frame_idx, _, out_mask_logits in predictor.propagate_in_video(
+        for out_frame_idx, _, out_mask_logits, _ in predictor.propagate_in_video(
             inference_state,
             start_frame_idx=min(input_frame_inds),
             reverse=False,
