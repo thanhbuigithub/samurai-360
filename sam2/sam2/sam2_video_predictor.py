@@ -194,7 +194,83 @@ class Omni360Helper:
         
         coords = torch.nonzero(mask_bool, as_tuple=False)
         return coords.shape[0] >= 8
+
+    def isCrossingBorder(self, mask_image):
+        """
+        Check if the mask needs to be rotated.
+        """
+        if len(mask_image.shape) > 2:
+            mask = mask_image[:, :, 0].copy()
+        else:
+            mask = mask_image.copy()
+
+        # Find mask pixels
+        v_coords, u_coords = np.where(mask > 127)
+        if len(v_coords) < 8:
+            return False
+        
+        # Get bounding box coordinates
+        u_min, u_max = np.min(u_coords), np.max(u_coords)
+        v_min, v_max = np.min(v_coords), np.max(v_coords)
+        
+        # Check for crossing border case (ROI wraps around horizontally)
+        # If width spans = width of image, likely crossing border
+        roi_width = u_max - u_min
+        crossing_border_h = roi_width >= self.img_w
+        
+        # Similar check for vertical (less common but possible)
+        roi_height = v_max - v_min
+        crossing_border_v = roi_height >= self.img_h
+        return crossing_border_h or crossing_border_v
     
+    def isCrossingBorder_torch(self, mask_image):
+        """
+        Check if the mask needs to be rotated.
+        """
+        if not isinstance(mask_image, torch.Tensor):
+            raise TypeError("mask2Bfov_torch expects mask_image to be a torch.Tensor")
+        
+        if mask_image.dim() > 2:
+            mask = mask_image[..., 0]
+        else:
+            mask = mask_image
+        
+        mask = mask.squeeze()
+        if mask.dim() != 2:
+            raise ValueError("mask2Bfov_torch expects a 2D mask after squeezing channels")
+        
+        self._refresh_intrinsics(mask.shape[1], mask.shape[0])
+        mask = mask.detach()
+        
+        if mask.dtype == torch.bool:
+            mask_bool = mask
+        else:
+            if mask.is_floating_point():
+                max_val = mask.max()
+                max_val_value = float(max_val.detach().item())
+                threshold = 0.5 if np.isfinite(max_val_value) and max_val_value <= 1.0 else 127.0
+            else:
+                threshold = 127
+            mask_bool = mask > threshold
+        
+        coords = torch.nonzero(mask_bool, as_tuple=False)
+        if coords.shape[0] < 8:
+            return None
+        
+        v_coords = coords[:, 0].float()
+        u_coords = coords[:, 1].float()
+        
+        u_min, u_max = torch.min(u_coords), torch.max(u_coords)
+        v_min, v_max = torch.min(v_coords), torch.max(v_coords)
+        
+        roi_width = u_max - u_min
+        crossing_border_h = bool((roi_width >= float(self.img_w)).item())
+        
+        roi_height = v_max - v_min
+        crossing_border_v = bool((roi_height >= float(self.img_h)).item())
+
+        return crossing_border_h or crossing_border_v
+
     def mask2Bfov(self, mask_image):
         """
         Convert mask to bounded field of view (Bfov) with spherical center.
@@ -279,7 +355,7 @@ class Omni360Helper:
         clon, clat = self.uv2lonlat(u_c, v_c)
         
         return {'clon': rad2ang(clon), 'clat': rad2ang(clat)}
-    
+
     def mask2Bfov_torch(self, mask_image):
         """
         Torch implementation of mask2Bfov for GPU-accelerated workflows.
@@ -393,6 +469,20 @@ class Omni360Helper:
         c_lat = ang2rad(bfov['clat'])
         return rotate_y(c_lon) @ rotate_x(c_lat)
 
+    def bfov2R_torch(self, bfov):
+        """
+        Convert bfov to rotation matrix R.
+        
+        Args:
+            bfov: dict containing 'clon' and 'clat'
+            
+        Returns:
+            R: 3x3 rotation matrix
+        """
+        c_lon = ang2rad(bfov['clon'])
+        c_lat = ang2rad(bfov['clat'])
+        return rotate_y(c_lon) @ rotate_x(c_lat)
+
     def mask2R_torch(self, mask_image):
         """
         Convert mask to rotation matrix R.
@@ -406,9 +496,7 @@ class Omni360Helper:
         bfov = self.mask2Bfov_torch(mask_image)
         if bfov is None:
             return None
-        c_lon = ang2rad(bfov['clon'])
-        c_lat = ang2rad(bfov['clat'])
-        return rotate_y(c_lon) @ rotate_x(c_lat)
+        return self.bfov2R_torch(bfov)
 
     def align_center_by_R(self, img, R):
         """
@@ -1020,7 +1108,9 @@ class SAM2VideoPredictor(SAM2Base):
         R_mask = None
         # print(f"Adding new mask at frame {frame_idx}. Enabled 360: {is_360}", flush=True)
         if is_360:
-            R_mask = omni_helper.mask2R_torch(mask)
+            bfov = omni_helper.mask2Bfov_torch(mask)
+            if bfov is not None:
+                R_mask = omni_helper.bfov2R_torch(bfov)
             # print(f"R_mask: {R_mask}", flush=True)
         if R_mask is not None:
             mask, _ = omni_helper.align_center_by_R_torch(mask, R_mask, device)
@@ -1484,9 +1574,10 @@ class SAM2VideoPredictor(SAM2Base):
                         if hasattr(omni_helper, 'revert_alignment_by_matrix_torch') and device.type == 'cuda':
                             for batch_frame_idx, (masks, storage_key) in batch_masks_to_revert.items():
                                 reverted_masks = []
+                                origin_masks = []
                                 for obj_idx_iter in range(len(obj_ids)):
                                     mask = masks[obj_idx_iter, 0]  # Keep on GPU (H, W)
-                                    
+                                    origin_masks.append(mask)
                                     # # Convert to uint8 range on GPU
                                     # mask_uint8 = (mask > 0.0).to(torch.uint8) * 255
                                     
@@ -1502,6 +1593,9 @@ class SAM2VideoPredictor(SAM2Base):
                                 # Stack masks (stay on GPU)
                                 reverted_masks_tensor = torch.stack(reverted_masks).unsqueeze(1)
                                 
+                                origin_masks_tensor = torch.stack(origin_masks).unsqueeze(1)
+                                if omni_helper.is_mask_valid_torch(origin_masks_tensor):
+                                    last_valid_mask_in_batch = origin_masks_tensor
                                 # Update stored masks in output_dict
                                 # storage_device = inference_state["storage_device"]
                                 # output_dict[storage_key][batch_frame_idx]["pred_masks"] = reverted_masks_tensor.to(storage_device, non_blocking=True)
@@ -1511,9 +1605,10 @@ class SAM2VideoPredictor(SAM2Base):
                             for batch_frame_idx, (masks, storage_key) in batch_masks_to_revert.items():
                                 masks_np = masks.cpu().numpy()
                                 reverted_masks = []
+                                origin_masks = []
                                 for obj_idx_iter in range(len(obj_ids)):
                                     mask = masks_np[obj_idx_iter, 0]  # (H, W)
-                                    
+                                    origin_masks.append(mask)
                                     # Convert mask to uint8
                                     mask_uint8 = ((mask > 0.0).astype(np.uint8) * 255)
                                     
@@ -1528,6 +1623,12 @@ class SAM2VideoPredictor(SAM2Base):
                                 reverted_masks_tensor = torch.from_numpy(
                                     np.array(reverted_masks)[:, None, :, :]
                                 ).to(device)
+
+                                origin_masks_tensor = torch.from_numpy(
+                                    np.array(origin_masks)[:, None, :, :]
+                                ).to(device)
+                                if omni_helper.is_mask_valid_torch(origin_masks_tensor):
+                                    last_valid_mask_in_batch = origin_masks_tensor
                                 
                                 # Update stored masks in output_dict
                                 # storage_device = inference_state["storage_device"]
@@ -1656,6 +1757,8 @@ class SAM2VideoPredictor(SAM2Base):
             if is_360_enabled and R_b is not None:
                 # Store masks for later reversion (keep on GPU)
                 batch_masks_to_revert[frame_idx] = (video_res_masks.clone(), storage_key)
+            else:
+                yield frame_idx, obj_ids, video_res_masks, None
         
         # ========== Final Batch Mask Reversion for 360 Video ==========
         # Revert masks from the last batch after loop completes
